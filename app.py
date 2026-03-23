@@ -8,11 +8,99 @@ from datetime import datetime, timedelta
 import io
 import json
 import re
+import requests
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.metrics import mean_absolute_percentage_error
 import warnings
 warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────
+# GEMINI CONFIG
+# ─────────────────────────────────────────────
+GEMINI_API_KEY = "AIzaSyAY7dMSyjQ4sr8vvatYD-mluzaXQFLwE9w"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+def call_gemini(prompt: str) -> str:
+    """Call Gemini API and return the text response."""
+    try:
+        resp = requests.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30
+        )
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return None
+
+
+def build_gemini_prompt(df, forecast_df, mape, product_name):
+    """Build a rich data prompt for Gemini to analyse."""
+    units = df["units_sold"].tolist()
+    dates = df["date"].dt.strftime("%b %Y").tolist()
+    trend_slope = float(np.polyfit(range(len(units)), units, 1)[0])
+    total_units = sum(units)
+    avg_monthly = np.mean(units)
+    next_3_forecast = forecast_df["forecast"].iloc[:3].tolist()
+    forecast_months = forecast_df["date"].dt.strftime("%b %Y").iloc[:3].tolist()
+
+    return_info = ""
+    if "units_returned" in df.columns and df["units_returned"].sum() > 0:
+        avg_rr = (df["units_returned"] / df["units_sold"]).mean() * 100
+        return_info = f"- Average return rate: {avg_rr:.1f}%"
+
+    revenue_info = ""
+    if "revenue" in df.columns:
+        total_rev = df["revenue"].sum()
+        revenue_info = f"- Total revenue: ${total_rev:,.0f}"
+
+    prompt = f"""You are a senior e-commerce sales analyst. Analyse the following product sales data and return a structured JSON response.
+
+PRODUCT: {product_name}
+SALES DATA (monthly units sold):
+{dict(zip(dates, units))}
+
+KEY METRICS:
+- Total units sold: {total_units:,}
+- Average monthly sales: {avg_monthly:.0f} units
+- Monthly trend slope: {trend_slope:+.1f} units/month
+- Forecast accuracy (MAPE): {mape:.1f}%
+{return_info}
+{revenue_info}
+
+NEXT 3-MONTH FORECAST:
+{dict(zip(forecast_months, next_3_forecast))}
+
+Return ONLY a valid JSON object (no markdown, no backticks) with this exact structure:
+{{
+  "summary": "2-3 sentence executive summary of overall product performance",
+  "insights": [
+    {{
+      "type": "success|warning|danger|info",
+      "title": "Short insight title with emoji",
+      "text": "2-3 sentence detailed insight with specific numbers from the data"
+    }}
+  ],
+  "why_not_selling": [
+    {{
+      "type": "warning|danger|info",
+      "title": "Reason title with emoji",
+      "text": "Specific reason tailored to this product's data pattern"
+    }}
+  ],
+  "recommendations": [
+    "Actionable recommendation 1 with specific detail",
+    "Actionable recommendation 2 with specific detail",
+    "Actionable recommendation 3 with specific detail"
+  ],
+  "risk_level": "low|medium|high",
+  "risk_reason": "One sentence explaining the risk assessment"
+}}
+
+Generate exactly 5 insights and 4 why_not_selling reasons. Base everything on the actual data provided. Be specific and quantitative."""
+    return prompt
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -241,84 +329,71 @@ def run_forecast(df, periods=6, degree=2):
 
 
 # ─────────────────────────────────────────────
-# AI INSIGHTS GENERATOR
+# AI INSIGHTS GENERATOR  (Gemini-powered)
 # ─────────────────────────────────────────────
-def generate_insights(df, forecast_df, mape, product_name):
-    insights = []
+def generate_insights_fallback(df, forecast_df, mape, product_name):
+    """Fallback static insights if Gemini is unavailable."""
+    insights, why_not, recs = [], [], []
     units = df["units_sold"].values
     trend_slope = np.polyfit(range(len(units)), units, 1)[0]
 
-    # Trend insight
     if trend_slope > 50:
         insights.append(("success", "📈 Strong Growth Trend",
-            f"**{product_name}** shows a consistent upward trend (+{trend_slope:.0f} units/month avg). "
-            "This suggests strong market demand and effective distribution."))
+            f"{product_name} shows a consistent upward trend (+{trend_slope:.0f} units/month). Strong market demand detected."))
     elif trend_slope < -50:
         insights.append(("danger", "📉 Declining Sales",
-            f"Sales are declining at ~{abs(trend_slope):.0f} units/month. Consider reviewing pricing, "
-            "competitor activity, or product lifecycle position."))
+            f"Sales are declining at ~{abs(trend_slope):.0f} units/month. Review pricing and competitor activity."))
     else:
-        insights.append(("", "➡️ Stable Sales Pattern",
-            f"Sales are relatively stable with minor fluctuations ({trend_slope:+.0f} units/month drift). "
-            "Focus on retention and upsell opportunities."))
+        insights.append(("info", "➡️ Stable Sales Pattern",
+            f"Sales are relatively stable ({trend_slope:+.0f} units/month drift). Focus on retention and upsell."))
 
-    # Seasonality
-    monthly_avg = df.groupby(df["date"].dt.month)["units_sold"].mean()
-    peak_month = monthly_avg.idxmax()
-    low_month = monthly_avg.idxmin()
-    month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
-                   7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
-    insights.append(("", "📅 Seasonal Pattern Detected",
-        f"Peak sales occur in **{month_names.get(peak_month,'N/A')}** while the lowest month is "
-        f"**{month_names.get(low_month,'N/A')}**. Plan inventory and marketing campaigns accordingly."))
-
-    # Return rate
-    if "units_returned" in df.columns and df["units_returned"].sum() > 0:
-        avg_return_rate = (df["units_returned"] / df["units_sold"]).mean() * 100
-        if avg_return_rate > 8:
-            insights.append(("danger", "⚠️ High Return Rate",
-                f"Average return rate is **{avg_return_rate:.1f}%** — above the 8% threshold. "
-                "Investigate product quality, description accuracy, or packaging issues."))
-        elif avg_return_rate > 5:
-            insights.append(("warning", "⚠️ Moderate Return Rate",
-                f"Return rate of **{avg_return_rate:.1f}%** is slightly elevated. "
-                "Monitor trends and gather customer feedback."))
-        else:
-            insights.append(("success", "✅ Low Return Rate",
-                f"Excellent return rate of **{avg_return_rate:.1f}%** — customers are satisfied with the product."))
-
-    # Forecast outlook
     next_3 = forecast_df["forecast"].iloc[:3].mean()
     current_3 = df["units_sold"].iloc[-3:].mean()
     change_pct = ((next_3 - current_3) / current_3) * 100
+    insights.append(("success" if change_pct > 0 else "warning", "📊 Forecast Outlook",
+        f"Next 3-month avg: {next_3:.0f} units ({change_pct:+.1f}% vs recent performance)."))
 
-    if change_pct > 5:
-        insights.append(("success", "🚀 Positive Forecast Outlook",
-            f"Next 3-month average forecast: **{next_3:.0f} units** (+{change_pct:.1f}% vs recent). "
-            f"Ensure stock levels can support anticipated demand."))
-    elif change_pct < -5:
-        insights.append(("warning", "⚡ Forecast Shows Slowdown",
-            f"Next 3-month forecast: **{next_3:.0f} units** ({change_pct:.1f}% vs recent). "
-            "Consider promotional campaigns or discount strategies to stimulate demand."))
-    else:
-        insights.append(("", "📊 Forecast Looks Steady",
-            f"Next 3-month forecast: **{next_3:.0f} units** — similar to current performance. "
-            "Maintain current strategy while exploring expansion opportunities."))
+    why_not = [
+        ("warning", "🏷️ Pricing Pressure", "Prices may be misaligned with market expectations. Monitor competitor pricing weekly."),
+        ("danger",  "📦 Inventory Risk",   "Potential stockout risk during peak periods. Review reorder points against forecast."),
+        ("info",    "🔍 Search Visibility","Low organic discoverability may be suppressing demand. Audit keywords and listings."),
+        ("warning", "⭐ Review Sentiment", "Customer sentiment directly impacts conversion. Maintain rating above 4.0 stars."),
+    ]
+    recs = [
+        "Align inventory levels with the 3-month forecast to avoid stockouts.",
+        "Run targeted promotions during historically low sales months.",
+        "Audit product listings and keywords to improve search visibility.",
+    ]
+    summary = f"{product_name} has {total_units:,} total units sold with a MAPE of {mape:.1f}%."
+    return summary, insights, why_not, recs, "medium", "Based on trend and forecast variance."
 
-    # Model quality
-    if mape < 5:
-        insights.append(("success", "🎯 High Model Accuracy",
-            f"Forecast model MAPE: **{mape:.1f}%** — excellent. Predictions are highly reliable for planning."))
-    elif mape < 12:
-        insights.append(("", "📐 Good Model Accuracy",
-            f"Forecast model MAPE: **{mape:.1f}%** — reasonable for production planning. "
-            "Collect more historical data to improve accuracy over time."))
-    else:
-        insights.append(("warning", "📐 Model Accuracy Warning",
-            f"Forecast model MAPE: **{mape:.1f}%** — high variance in data makes prediction challenging. "
-            "Use forecast as a directional guide rather than exact figure."))
 
-    return insights
+@st.cache_data(show_spinner=False)
+def generate_gemini_insights(df_json, forecast_json, mape, product_name):
+    """Call Gemini and parse structured JSON insights. Cached per data snapshot."""
+    df = pd.read_json(io.StringIO(df_json))
+    df["date"] = pd.to_datetime(df["date"])
+    forecast_df = pd.read_json(io.StringIO(forecast_json))
+    forecast_df["date"] = pd.to_datetime(forecast_df["date"])
+
+    prompt = build_gemini_prompt(df, forecast_df, mape, product_name)
+    raw = call_gemini(prompt)
+    if raw is None:
+        return None
+
+    # Strip markdown fences if present
+    clean = re.sub(r"```json|```", "", raw).strip()
+    try:
+        return json.loads(clean)
+    except Exception:
+        # Try extracting JSON block
+        match = re.search(r"\{.*\}", clean, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except Exception:
+                pass
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -565,7 +640,6 @@ if error_msg:
 # ─────────────────────────────────────────────
 degree = complexity_map[model_complexity]
 forecast_df, y_pred, mape, model, poly = run_forecast(df, forecast_periods, degree)
-insights = generate_insights(df, forecast_df, mape, selected_product)
 
 
 # ─────────────────────────────────────────────
@@ -676,54 +750,116 @@ forecast = model.predict(poly.transform(X_future))
         """, language="python")
 
 with tab2:
-    st.markdown('<div class="section-header">AI-Generated Insights</div>', unsafe_allow_html=True)
-    st.markdown(f"<p style='color:#64748b;font-size:0.85rem;'>Automated analysis of {selected_product} performance and forecast</p>", unsafe_allow_html=True)
+    st.markdown('<div class="section-header">✨ Gemini AI Insights</div>', unsafe_allow_html=True)
+    st.markdown(f"<p style='color:#64748b;font-size:0.85rem;'>Powered by Google Gemini 2.0 Flash — real-time analysis of <b>{selected_product}</b></p>", unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    for insight_type, title, text in insights:
-        type_class = f"insight-box {insight_type}" if insight_type else "insight-box"
+    # ── Gemini call with spinner ──────────────────────────────
+    with st.spinner("🤖 Gemini is analysing your sales data..."):
+        gemini_result = generate_gemini_insights(
+            df.to_json(),
+            forecast_df.to_json(),
+            mape,
+            selected_product
+        )
+
+    # ── RENDER GEMINI RESPONSE ────────────────────────────────
+    if gemini_result:
+
+        # Risk badge
+        risk = gemini_result.get("risk_level", "medium")
+        risk_reason = gemini_result.get("risk_reason", "")
+        risk_badge = {"low": "badge-green", "medium": "badge-amber", "high": "badge-red"}.get(risk, "badge-amber")
+        risk_label = {"low": "🟢 Low Risk", "medium": "🟡 Medium Risk", "high": "🔴 High Risk"}.get(risk, "Medium Risk")
+
+        # Executive summary
+        summary = gemini_result.get("summary", "")
         st.markdown(f"""
-        <div class="{type_class}">
-            <div class="insight-title">{title}</div>
-            <div class="insight-text">{text}</div>
+        <div style='background:linear-gradient(135deg,#f8faff,#eef2ff);border:1px solid #c7d2fe;
+                    border-radius:14px;padding:1.2rem 1.4rem;margin-bottom:1.4rem;'>
+            <div style='display:flex;align-items:center;gap:0.8rem;margin-bottom:0.6rem;'>
+                <span style='font-size:1.1rem;font-weight:700;color:#3730a3;'>Executive Summary</span>
+                <span class="badge {risk_badge}">{risk_label}</span>
+            </div>
+            <div style='font-size:0.88rem;color:#374151;line-height:1.6;'>{summary}</div>
+            <div style='font-size:0.78rem;color:#6b7280;margin-top:0.5rem;font-style:italic;'>{risk_reason}</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("<br>")
-    st.markdown("#### Why Products Don't Sell — Common Factors")
-    reasons_col1, reasons_col2 = st.columns(2)
+        # ── Insights ─────────────────────────────────────────
+        st.markdown("#### 📊 Performance Insights")
+        insights = gemini_result.get("insights", [])
+        for ins in insights:
+            itype = ins.get("type", "info")
+            type_class = f"insight-box {itype}" if itype in ["success","warning","danger"] else "insight-box"
+            st.markdown(f"""
+            <div class="{type_class}">
+                <div class="insight-title">{ins.get('title','')}</div>
+                <div class="insight-text">{ins.get('text','')}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    with reasons_col1:
-        st.markdown("""
-        <div class="insight-box warning">
-            <div class="insight-title">🏷️ Pricing Issues</div>
-            <div class="insight-text">Products priced too high vs competitors or perceived value lose customers. Monitor price elasticity and competitor pricing weekly.</div>
-        </div>
-        <div class="insight-box warning">
-            <div class="insight-title">📦 Inventory / Stockouts</div>
-            <div class="insight-text">Being out of stock is the #1 silent killer of sales. Lost sales due to stockouts don't show in your data — they're just missing revenue.</div>
-        </div>
-        <div class="insight-box">
-            <div class="insight-title">🔍 Search Visibility</div>
-            <div class="insight-text">Poor SEO, missing keywords, or low organic rank on Amazon/Google means customers simply don't find the product.</div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("<br>")
 
-    with reasons_col2:
-        st.markdown("""
-        <div class="insight-box danger">
-            <div class="insight-title">⭐ Negative Reviews</div>
-            <div class="insight-text">Products with average rating below 3.5 see significant conversion drops. Even a single viral negative review can crater sales temporarily.</div>
-        </div>
-        <div class="insight-box">
-            <div class="insight-title">📸 Poor Product Imagery</div>
-            <div class="insight-text">Low-quality images or misleading photos lead to high return rates and low CTR. Professional photography typically improves conversions 25-40%.</div>
-        </div>
-        <div class="insight-box warning">
-            <div class="insight-title">🌍 Seasonality & Market Shift</div>
-            <div class="insight-text">Demand naturally drops outside peak season. Complement with promotions, bundling, or new market segments during off-peak periods.</div>
-        </div>
-        """, unsafe_allow_html=True)
+        # ── Why not selling ──────────────────────────────────
+        st.markdown("#### ❓ Why This Product May Not Be Selling")
+        why_list = gemini_result.get("why_not_selling", [])
+        wc1, wc2 = st.columns(2)
+        for i, w in enumerate(why_list):
+            wtype = w.get("type", "warning")
+            type_class = f"insight-box {wtype}" if wtype in ["success","warning","danger"] else "insight-box"
+            html = f"""
+            <div class="{type_class}">
+                <div class="insight-title">{w.get('title','')}</div>
+                <div class="insight-text">{w.get('text','')}</div>
+            </div>"""
+            if i % 2 == 0:
+                wc1.markdown(html, unsafe_allow_html=True)
+            else:
+                wc2.markdown(html, unsafe_allow_html=True)
+
+        st.markdown("<br>")
+
+        # ── Recommendations ──────────────────────────────────
+        st.markdown("#### 🎯 Gemini's Recommendations")
+        recs = gemini_result.get("recommendations", [])
+        for i, rec in enumerate(recs, 1):
+            st.markdown(f"""
+            <div style='display:flex;gap:0.8rem;align-items:flex-start;
+                        background:white;border:1px solid #e2e8f0;border-radius:10px;
+                        padding:0.9rem 1.1rem;margin-bottom:0.6rem;'>
+                <span style='background:#6366f1;color:white;border-radius:50%;
+                             width:24px;height:24px;display:flex;align-items:center;
+                             justify-content:center;font-size:0.75rem;font-weight:700;
+                             flex-shrink:0;'>{i}</span>
+                <span style='font-size:0.85rem;color:#374151;line-height:1.5;'>{rec}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Regenerate button
+        st.markdown("<br>")
+        if st.button("🔄 Regenerate Insights", help="Clear cache and ask Gemini again"):
+            generate_gemini_insights.clear()
+            st.rerun()
+
+    else:
+        # ── Fallback if Gemini fails ─────────────────────────
+        st.warning("⚠️ Gemini API is currently unreachable. Showing built-in insights instead.")
+        total_units = df["units_sold"].sum()
+        summary, fb_insights, fb_why, fb_recs, fb_risk, fb_risk_reason = generate_insights_fallback(
+            df, forecast_df, mape, selected_product
+        )
+        st.markdown(f"**Summary:** {summary}")
+        for itype, title, text in fb_insights:
+            type_class = f"insight-box {itype}" if itype in ["success","warning","danger"] else "insight-box"
+            st.markdown(f'<div class="{type_class}"><div class="insight-title">{title}</div>'
+                        f'<div class="insight-text">{text}</div></div>', unsafe_allow_html=True)
+        st.markdown("#### Why Products May Not Sell")
+        c1f, c2f = st.columns(2)
+        for i, (wtype, wtitle, wtext) in enumerate(fb_why):
+            type_class = f"insight-box {wtype}" if wtype in ["success","warning","danger"] else "insight-box"
+            html = f'<div class="{type_class}"><div class="insight-title">{wtitle}</div><div class="insight-text">{wtext}</div></div>'
+            (c1f if i % 2 == 0 else c2f).markdown(html, unsafe_allow_html=True)
 
 with tab3:
     st.markdown('<div class="section-header">Analytics Deep Dive</div>', unsafe_allow_html=True)
