@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 # ─────────────────────────────────────────────
 # GEMINI CONFIG
 # ─────────────────────────────────────────────
-GEMINI_API_KEY = st.secrets["AIzaSyAY7dMSyjQ4sr8vvatYD-mluzaXQFLwE9w"]
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "AIzaSyAY7dMSyjQ4sr8vvatYD-mluzaXQFLwE9w")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 def call_gemini(prompt: str) -> str:
