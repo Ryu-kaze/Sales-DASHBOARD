@@ -19,19 +19,14 @@ warnings.filterwarnings('ignore')
 # GEMINI CONFIG
 # ─────────────────────────────────────────────
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "AIzaSyAY7dMSyjQ4sr8vvatYD-mluzaXQFLwE9w")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-
 def call_gemini(prompt: str) -> str:
-    """Call Gemini API and return the text response."""
+    """Call Gemini using the official google-generativeai SDK."""
     try:
-        resp = requests.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30
-        )
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+        return response.text
     except Exception as e:
         return None
 
